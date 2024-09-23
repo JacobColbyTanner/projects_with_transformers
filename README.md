@@ -6,3 +6,5 @@ Here, I will be teaching myself how to use transformer models by training transf
 
 1st: I will be performing next word prediction/generation on Shakespeare task (as in the tutorial above), but I will be changing the embedding from letter embeddings to word or partial word embeddings using different packages
 
+2nd: I will predict the next time step of neural activity by training a transformer on fMRI data.
+
