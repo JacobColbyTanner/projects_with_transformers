@@ -83,7 +83,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
+        self.attention_weights = []
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -98,6 +98,7 @@ class Head(nn.Module):
         # perform the weighted aggregation of the values
         v = self.value(x) # (B,T,C)
         out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
+        self.attention_weights = wei
         return out
 
 class MultiHeadAttention(nn.Module):
@@ -157,6 +158,7 @@ class fMRI_transformer_model(nn.Module):
         self.block_size = block_size
         self.blocks = nn.Sequential(*[Block(n_embd, n_head, dropout, block_size) for _ in range(n_layer)])
         self.device = device
+        self.attention_weights = []
 
     def forward(self, idx, targets=None):
         B, T, C = idx.shape
