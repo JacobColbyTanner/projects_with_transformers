@@ -64,7 +64,7 @@ class RotationalHead(nn.Module):
         B, T, C = x.shape
         transform = self.transformation(x)  # (B, T, C) -> (B, T, C^2)
         transform = transform.view(B, T, C, C)  # reshape to (B, T, C, C)
-        
+        transform = transform*0
         # Multiply each time point's transformed embedding by every other time point's embedding
         # (B, T, C, C) x (B, T, C) -> (B, T, T, C)
         out = torch.einsum('bcij,btj->btcj', transform, x)

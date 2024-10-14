@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-
+import time
 # Original version of this code comes from a transformer building tutorial by Andrej Karpathy
 #Original repo: https://github.com/karpathy/ng-video-lecture.git
 #Original video: https://youtu.be/kCc8FmEb1nY?si=LRlFNDmZms70MkDe
@@ -29,18 +29,34 @@ class LayerNorm1d: # (used to be BatchNorm1d)
   
 
 
-def get_fMRI_batch(data,batch_size, block_size, train_test='train'):
+def get_fMRI_batch(data,batch_size, block_size, train_test='train',split_type = 'subject'):
     
     #loop through number of batches and get random subjects ts that is block_size long
     for i in range(batch_size):
-        #get random subject
-        subject = np.random.randint(0,95)
-        subject_ts_across_scans = data[0,subject]
-        #get random scan, first two scans are train, last 2 are test
-        if train_test == 'train':
-            scan = np.random.randint(0,2)
-        elif train_test == 'test':
-            scan = np.random.randint(2,4)
+        if split_type == 'subject':
+            if train_test == 'train':
+                #get random subject
+                subject = np.random.randint(0,76)
+                subject_ts_across_scans = data[0,subject]
+                #get random scan
+                scan = np.random.randint(0,4)
+            elif train_test == 'test':
+                #get random subject
+                subject = np.random.randint(76,95)
+                subject_ts_across_scans = data[0,subject]
+                #get random scan
+                scan = np.random.randint(0,4)
+            
+        elif split_type == 'scan':
+            #get random subject
+            subject = np.random.randint(0,95)
+            subject_ts_across_scans = data[0,subject]
+            #get random scan, first two scans are train, last 2 are test
+            if train_test == 'train':
+                scan = np.random.randint(0,2)
+            elif train_test == 'test':
+                scan = np.random.randint(2,4)
+        
         ts = subject_ts_across_scans['func']['scan'][0][0]['ts'][0][scan]
         #get random block
         block = np.random.randint(0,ts.shape[0]-(block_size+1))
@@ -61,13 +77,13 @@ def get_fMRI_batch(data,batch_size, block_size, train_test='train'):
 
 
 @torch.no_grad()
-def estimate_loss(model, data, eval_iters, block_size, batch_size):
+def estimate_loss(model, data, eval_iters, block_size, batch_size,split_type='subject'):
     out = {}
     model.eval()
     for split in ['train', 'test']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_fMRI_batch(data,batch_size, block_size,train_test=split)
+            X, Y = get_fMRI_batch(data,batch_size, block_size,train_test=split,split_type=split_type)
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
@@ -194,3 +210,232 @@ class fMRI_transformer_model(nn.Module):
             # append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=0) # (block_size, num_brain_regions)
         return idx
+
+
+
+
+class ActivationCollector:
+    def __init__(self,model,data,block_size,number_of_prediction_steps,subject,scan,add_first_and_final_frame=True):
+        self.model = model
+        self.block_size = block_size
+        self.activations = []
+        self.heads_just_done = False
+        self.head_outputs_all = []
+        self.hook_handles = []
+        self.head_num = 0
+        self.num_steps = number_of_prediction_steps
+        self.data = data
+        self.register_hooks()
+        self.all_embedding_trajectories, self.all_facts = self.generate_activations(subject,scan,add_first_and_final_frame)
+        self.remove_hooks() #this saves memory
+
+    def get_activation(self, name):
+        def hook(model, input, output):
+            # if name contains 'head', store the output
+            #print("collecting activations of: ",name)
+            if 'head' in name:
+                #print("collecting head activations")
+                self.heads_just_done = True
+                head_output_next = output[:,-1,:].detach().numpy().squeeze().squeeze() #get last embedding from block size (because this is what becomes the prediction)
+                if self.head_num == 0:
+                    self.head_outputs_all = head_output_next
+                    #print("collected first head")
+                else:
+                    self.head_outputs_all = np.concatenate((self.head_outputs_all,head_output_next),axis=0)
+                self.head_num += 1
+            else:
+                if self.heads_just_done:
+                    self.activations.append(self.head_outputs_all)
+                    self.activations.append(output[:,-1,:].detach().numpy().squeeze().squeeze()) #get last embedding from block size (because this is what becomes the prediction)
+                    self.heads_just_done = False
+                else:
+                    self.activations.append(output[:,-1,:].detach().numpy().squeeze().squeeze()) #get last embedding from block size (because this is what becomes the prediction)
+        return hook
+    
+
+    def register_hooks(self):
+        # Register hooks for the layers of interest and store the handles
+        for i, head in enumerate(self.model.blocks[0].sa.heads):
+            handle = head.register_forward_hook(self.get_activation(f'head_{i}'))
+            self.hook_handles.append(handle)
+
+        handle = self.model.blocks[0].sa.proj.register_forward_hook(self.get_activation('proj'))
+        self.hook_handles.append(handle)
+
+        handle = self.model.blocks[0].ln1.register_forward_hook(self.get_activation('ln_1'))
+        self.hook_handles.append(handle)
+
+        handle = self.model.blocks[0].ln2.register_forward_hook(self.get_activation('ln_2'))
+        self.hook_handles.append(handle)
+
+        handle = self.model.blocks[0].ffwd.net[2].register_forward_hook(self.get_activation('FF_out'))
+        self.hook_handles.append(handle)
+
+    def remove_hooks(self):
+        # Remove all registered hooks
+        for handle in self.hook_handles:
+            handle.remove()
+        self.hook_handles = []
+
+    def get_subject_time_series(self,subject,scan,data):
+        #get subject
+        subject_ts_across_scans = data[0,subject]
+        #select scan
+        subject_ts = torch.tensor(subject_ts_across_scans['func']['scan'][0][0]['ts'][0][scan], dtype=torch.float)
+        return subject_ts
+
+    def generate_activations(self,subject,scan,add_first_and_final_frame):
+        #select a subjects time series
+        subject_ts = self.get_subject_time_series(subject,scan,self.data)
+        start = 0
+        stop = self.block_size
+        all_facts = []
+        for i in range(self.num_steps):
+            #print("prediction step: ",i)
+            context = subject_ts[start:stop,:] #get the context
+            # generate from the model
+            predicted_fMRI = self.model.generate(context, max_new_tokens=1)
+            self.activations = np.array(self.activations)
+            T, C = context.shape
+            #get the positional embeddings
+            pos_emb = self.model.position_embedding_table(torch.arange(T))
+            #add to context to get the embeddings that are passed to the model
+            context_pos = context + pos_emb
+            #grab last frame corresponding to the prediction that will be made
+            context_pos = context_pos[-1,:].unsqueeze(0).detach().numpy()
+            #get fMRI final frame from input sequence (which will transform into the prediction)
+            final = context[-1,:].unsqueeze(0).detach().numpy()
+            pred_frame = predicted_fMRI[-1].unsqueeze(0).detach().numpy()
+            #get output from the FFWD layer of the model (without the residual connection so that this is just the transform of the embedding to be added to the embeddding)
+            fact = self.activations[-1]
+            #concatenate the embedding transformations, and add the context_positional embeddings to the activations for transformations of the embedding (because this is a resnet)
+            if add_first_and_final_frame:
+                embedding_trajectory = np.concatenate((final,context_pos,self.activations+context_pos,pred_frame),axis=0)
+            else:
+                embedding_trajectory = np.concatenate((context_pos,self.activations+context_pos),axis=0)
+            if i == 0:
+                all_embedding_trajectories = embedding_trajectory
+            else:
+                all_embedding_trajectories = np.concatenate((all_embedding_trajectories,embedding_trajectory),axis=0)
+            
+            all_facts.append(fact)
+            self.activations = []
+            self.heads_just_done = False
+            self.head_outputs_all = []
+            self.head_num = 0
+            start += self.block_size #non-overlapping blocks
+            stop += self.block_size
+            
+        
+        return all_embedding_trajectories, all_facts
+    
+def get_stack_labels(index_num, num_pred_steps, with_first_last):
+    #get boolean indices for different layers of the embedding transformation
+    #0 - positional encoding, 1 - layer norm(1), 2 - self attention, 3 - projection, 4 - layer norm(2), 5 - feed forward
+    if with_first_last:
+        labels = []
+        for i in range(num_pred_steps):
+            index = np.zeros(8)
+            index[index_num+1] = 1
+            #concatenate index to the end of labels
+            labels = np.concatenate((labels,index),axis=0)
+    else:
+        labels = []
+        for i in range(num_pred_steps):
+            index = np.zeros(6)
+            index[index_num] = 1
+            #concatenate index to the end of labels
+            labels = np.concatenate((labels,index),axis=0)
+            
+    #turn labels into boolean array
+    labels = np.array(labels).astype(bool)
+    return labels
+
+
+def get_within_vs_between_embeddings(embedding_trajectories,num_subjects,num_pred_steps,with_first_last):
+    
+    #see if subject specific information exists in data
+    r_between = np.full((num_subjects,num_subjects), np.nan)
+    r_within = np.full((num_subjects), np.nan)
+    num_scans = 4
+    tempor = np.full((num_scans,num_scans), np.nan)
+    if with_first_last: 
+        embedding = embedding_trajectories.reshape(num_subjects,num_scans*num_pred_steps*8,200)
+    else:
+        embedding = embedding_trajectories.reshape(num_subjects,num_scans*num_pred_steps*6,200)
+    indices = get_stack_labels(5, num_pred_steps, with_first_last)
+    
+
+    for subject_i in range(num_subjects):
+        #calculate within subject similarity of embedding space
+        for scan_i in range(num_scans):
+            for scan_j in range(num_scans):
+                if scan_i != scan_j:
+                    #mean value of embedding
+                    embedding_i = np.mean(embedding_trajectories[subject_i, scan_i,indices,:].squeeze().squeeze(),axis=0)
+                    embedding_j = np.mean(embedding_trajectories[subject_i, scan_j,indices,:].squeeze().squeeze(),axis=0)
+                    tempor[scan_i,scan_j] = np.corrcoef(embedding_i, embedding_j)[0,1]
+        r_within[subject_i] = np.nanmean(tempor)
+        
+        for subject_j in range(num_subjects):
+            if subject_i != subject_j:
+                #reshape embedding trajectorys to (subject,scan*time,brain_regions)
+                #mean value of embedding
+                #embedding_i = np.mean(embedding[subject_i, :,:].squeeze(),axis=0)
+                #embedding_j = np.mean(embedding[subject_j, :,:].squeeze(),axis=0)
+                embedding_i = np.mean(embedding_trajectories[subject_i, 0,indices,:].squeeze().squeeze(),axis=0)
+                embedding_j = np.mean(embedding_trajectories[subject_j, 0,indices,:].squeeze().squeeze(),axis=0)
+                #correlate embedding i and embedding j 
+                r_between[subject_i,subject_j]= np.corrcoef(embedding_i, embedding_j)[0,1]
+
+    
+    r_between_flat = r_between[~np.isnan(r_between)]
+    r_within = r_within[~np.isnan(r_within)]
+
+    #get mean difference
+    mean_within = np.mean(r_within)
+    mean_between = np.mean(r_between_flat)
+    diff = mean_within - mean_between
+
+    return r_within, r_between_flat, diff
+
+def get_within_vs_between_facts(all_facts,num_subjects):
+    
+    #see if subject specific information exists in data
+    r_between = np.full((num_subjects,num_subjects), np.nan)
+    r_within = np.full((num_subjects), np.nan)
+    num_scans = 4
+    tempor = np.full((num_scans,num_scans), np.nan)
+    for subject_i in range(num_subjects):
+        #calculate within subject similarity of embedding space
+        for scan_i in range(num_scans):
+            for scan_j in range(num_scans):
+                if scan_i != scan_j:
+                    #mean value of embedding
+                    embedding_i = np.mean(all_facts[subject_i, scan_i,:,:].squeeze().squeeze(),axis=0)
+                    embedding_j = np.mean(all_facts[subject_i, scan_j,:,:].squeeze().squeeze(),axis=0)
+                    tempor[scan_i,scan_j] = np.corrcoef(embedding_i, embedding_j)[0,1]
+        r_within[subject_i] = np.nanmean(tempor)
+        
+        for subject_j in range(num_subjects):
+            if subject_i != subject_j:
+                #reshape embedding trajectorys to (subject,scan*time,brain_regions)
+                #mean value of embedding
+                #embedding_i = np.mean(embedding[subject_i, :,:].squeeze(),axis=0)
+                #embedding_j = np.mean(embedding[subject_j, :,:].squeeze(),axis=0)
+                embedding_i = np.mean(all_facts[subject_i, 0,:,:].squeeze().squeeze(),axis=0)
+                embedding_j = np.mean(all_facts[subject_j, 0,:,:].squeeze().squeeze(),axis=0)
+                #correlate embedding i and embedding j 
+                r_between[subject_i,subject_j]= np.corrcoef(embedding_i, embedding_j)[0,1]
+
+    
+    r_between_flat = r_between[~np.isnan(r_between)]
+    r_within = r_within[~np.isnan(r_within)]
+
+    #get mean difference
+    mean_within = np.mean(r_within)
+    mean_between = np.mean(r_between_flat)
+    diff = mean_within - mean_between
+
+    return r_within, r_between_flat, diff
+

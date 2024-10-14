@@ -240,7 +240,7 @@ class Head(nn.Module):
         k = self.key(x)   # (B,T,C)
         q = self.query(x) # (B,T,C)
         # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2,-1) * self.head_size**0.5 # (B, T, C) @ (B, C, T) -> (B, T, T) #also scaling by head_size so that the attention weights don't become basically one-hot encodings
+        wei = q @ k.transpose(-2,-1) * self.head_size**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T) #also scaling by head_size so that the attention weights don't become basically one-hot encodings
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
