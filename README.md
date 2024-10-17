@@ -23,6 +23,7 @@ Shaw, P., Uszkoreit, J., & Vaswani, A. (2018). Self-attention with relative posi
 Additionally, this paper uses a different data representation for MIDI involving 413 dimensional one hot encoding vectors representing different Note on, Note off, Velocity, and Time events. This comes from the following paper (RNN paper): 
 Oore, S., Simon, I., Dieleman, S., Eck, D., & Simonyan, K. (2020). This time with feeling: Learning expressive musical performance. Neural Computing and Applications, 32, 955-967.
 
+5th: Use LSTM and other RNN models to perform next word prediction with the Shakespeare dataset
 
-
+6th: Use LSTM to model classical piano music.
 
