@@ -30,6 +30,8 @@ def encode_velocity(velocity):
 def encode_time_shift(time):
     # Divide time by how many increments of 8ms have passed (this is roughly 8ms given that time is in 0.96 ms here)
     digitized_time = torch.round(torch.tensor(time) / 8)
+    #cap the max value of digitized time
+    digitized_time = torch.clamp(digitized_time, 0, 200)
     time_encoding = digitized_time + TIME_SHIFT_OFFSET
     return time_encoding.to(torch.int64) 
 
@@ -185,6 +187,7 @@ def estimate_loss(model, data, eval_iters, block_size, batch_size, dataset_size)
     model.eval()
     for split in ['train', 'test']:
         losses = torch.zeros(eval_iters)
+        NLL_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(data,batch_size, block_size, dataset_size, train_test=split)
             logits, loss = model(X, Y)
@@ -192,6 +195,8 @@ def estimate_loss(model, data, eval_iters, block_size, batch_size, dataset_size)
         out[split] = losses.mean()
     model.train()
     return out
+
+
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -205,22 +210,26 @@ class Head(nn.Module):
         self.block_size = block_size
         self.dropout = nn.Dropout(dropout)
         self.head_size = head_size
+        self.use_relational_position = use_relational_position
         if use_relational_position:
-            self.use_relational_position = use_relational_position
-            self.max_relative_positions = max_relative_positions
+            #make max relative positions into a trainable parameter
+            self.max_relative_positions = nn.Parameter(torch.tensor(max_relative_positions, dtype=torch.float32))
             # Relative position embeddings for K and V
-            self.relative_k_positional_embeddings = nn.Embedding(2 * max_relative_positions + 1, head_size)
-            self.relative_v_positional_embeddings = nn.Embedding(2 * max_relative_positions + 1, head_size)
+            self.relative_k_positional_embeddings = nn.Embedding(2 * int(self.max_relative_positions.item()) + 1, head_size)
+            self.relative_v_positional_embeddings = nn.Embedding(2 * int(self.max_relative_positions.item()) + 1, head_size)
+        self.use_relational_time_pitch = use_relational_time_pitch
         if use_relational_time_pitch:
-            self.use_relational_time_pitch = True
-            self.max_relative_time = 20
-            self.max_relative_pitch = 128
+            #make max relative time and pitch into trainable parameters
+            max_relative_time = 200
+            max_relative_pitch = 128
+            self.max_relative_time = nn.Parameter(torch.tensor(max_relative_time, dtype=torch.float32))
+            self.max_relative_pitch = nn.Parameter(torch.tensor(max_relative_pitch, dtype=torch.float32))
             # Relative time embeddings for K and V
-            self.relative_k_time_embeddings = nn.Embedding(2 * self.max_relative_time + 1, head_size)
-            self.relative_v_time_embeddings = nn.Embedding(2 * self.max_relative_time + 1, head_size)
+            self.relative_k_time_embeddings = nn.Embedding(2 * int(self.max_relative_time.item()) + 1, head_size)
+            self.relative_v_time_embeddings = nn.Embedding(2 * int(self.max_relative_time.item()) + 1, head_size)
             # Relative pitch embeddings for K and V
-            self.relative_k_pitch_embeddings = nn.Embedding(2 * self.max_relative_pitch + 1, head_size)
-            self.relative_v_pitch_embeddings = nn.Embedding(2 * self.max_relative_pitch + 1, head_size)
+            self.relative_k_pitch_embeddings = nn.Embedding(2 * int(self.max_relative_pitch.item()) + 1, head_size)
+            self.relative_v_pitch_embeddings = nn.Embedding(2 * int(self.max_relative_pitch.item()) + 1, head_size)
 
     def forward(self, x, token_batch):
         B,T,C = x.shape
@@ -279,9 +288,9 @@ class Head(nn.Module):
     def relative_position(self,T,embed):
         positions = torch.arange(T)
         position_distance = positions.unsqueeze(0)-positions.unsqueeze(1)
-        position_distance_clamp = torch.clamp(position_distance, -self.max_relative_positions, self.max_relative_positions)
+        position_distance_clamp = torch.clamp(position_distance, -int(self.max_relative_positions.item()), int(self.max_relative_positions.item()))
         # Add max_relative_positions to make it positive (because these are indices into the embeddings table, diagonal is still always equivalent to the zero distance embedding)
-        position_distance_clamp_idx = position_distance_clamp+self.max_relative_positions
+        position_distance_clamp_idx = position_distance_clamp + int(self.max_relative_positions.item())
         position_distance_clamp_idx = torch.LongTensor(position_distance_clamp_idx)
         if embed == "v":
             relative_embeddings = self.relative_v_positional_embeddings(position_distance_clamp_idx)
@@ -353,10 +362,10 @@ class Head(nn.Module):
         time_distance = propagated_time_values.unsqueeze(1) - propagated_time_values.unsqueeze(2)
 
         # Zero index for tokens with unknown times
-        time_distance_clamp = torch.clamp(time_distance, -self.max_relative_time, self.max_relative_time)
+        time_distance_clamp = torch.clamp(time_distance, -int(self.max_relative_time.item()), int(self.max_relative_time.item()))
 
         # Add max_relative_time to make it positive
-        time_distance_clamp_idx = time_distance_clamp + self.max_relative_time
+        time_distance_clamp_idx = time_distance_clamp + int(self.max_relative_time.item())
 
         unknown_time = torch.isnan(time_distance_clamp_idx)
         time_distance_clamp_idx[unknown_time] = 0
@@ -452,10 +461,10 @@ class Head(nn.Module):
 
 
         note_distance = propagated_note_values.unsqueeze(1) - propagated_note_values.unsqueeze(2)
-        note_distance_clamp = torch.clamp(note_distance, -self.max_relative_pitch, self.max_relative_pitch)
+        note_distance_clamp = torch.clamp(note_distance, -int(self.max_relative_pitch.item()), int(self.max_relative_pitch.item()))
 
         # Add max_relative_pitch to make it positive
-        note_distance_clamp_idx = note_distance_clamp + self.max_relative_pitch
+        note_distance_clamp_idx = note_distance_clamp + int(self.max_relative_pitch.item())
         unknown_notes = torch.isnan(note_distance_clamp_idx)
         note_distance_clamp_idx[unknown_notes] = 0
         # Convert to LongTensor
@@ -488,9 +497,9 @@ class FeedFoward(nn.Module):
     def __init__(self, n_embd, dropout):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
+            nn.Linear(n_embd, 2 * n_embd), #to match the archetecture of the transformer used in MUSIC TRANSFORMER from Google Brain
             nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
+            nn.Linear(2 * n_embd, n_embd),
             nn.Dropout(dropout),
         )
 
@@ -523,7 +532,7 @@ class CustomSequential(nn.Sequential):
 # super simple bigram model
 class Music_transformer_Model(nn.Module):
 
-    def __init__(self,n_embd, n_head, dropout, vocab_size, block_size, n_layer, device,use_relational_position=True,use_relational_time_pitch=True):
+    def __init__(self,n_embd, n_head, dropout, vocab_size, block_size, n_layer, device,use_relational_position=True,use_relational_time_pitch=True,use_positional_encoding = True):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
@@ -533,14 +542,18 @@ class Music_transformer_Model(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
         self.device = device
+        self.use_positional_encoding = use_positional_encoding
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=self.device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
+        if self.use_positional_encoding:
+            pos_emb = self.position_embedding_table(torch.arange(T, device=self.device)) # (T,C)
+            x = tok_emb + pos_emb # (B,T,C)
+        else:
+            x = tok_emb
         x, idx = self.blocks(x,idx) # (B,T,C) also gets the tokens themselves (for relational time and pitch embedding)
         x = self.ln_f(x) # (B,T,C)
         logits = self.lm_head(x) # (B,T,vocab_size)

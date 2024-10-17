@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from models.transformer_model4 import decode_velocity, get_batch, estimate_loss, Music_transformer_Model, load_maestro_dataset, get_decodings
+from models.LSTM_model import LSTMModel
 import numpy as np
 import time
 
@@ -11,21 +12,18 @@ train_from_pretrained = False
 # hyperparameters
 batch_size = 25 # how many independent sequences will we process in parallel?
 block_size = 100 # what is the maximum context length for predictions?
-max_iters = 2000
+max_iters = 1000
 eval_interval = 100
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 50
-n_head = 8
-n_embd = 256 #n_head*256 #must be a multiple of n_head, or the head size calculation must be changed in the model
-n_layer = 2
-dropout = 0.1
+n_embd = 200
+n_layer = 1
+hidden_size = 500
 dataset_size = 10
-use_relational_position_embedding = False
-use_relational_time_and_pitch_embeddings = True
-use_positional_encoding = False
+
 # ------------
-output_midi_file_path = '/Users/jacobtanner/Downloads/generated_music_relative_attention33.midi'
+output_midi_file_path = '/Users/jacobtanner/Downloads/LSTM_music.midi'
 
 
 torch.manual_seed(1337)
@@ -40,14 +38,11 @@ flat_encodings = [item for sublist in all_encodings for item in sublist]
 # Get the vocab size
 vocab_size = np.max(np.array(flat_encodings)) + 1
 
-
-model = Music_transformer_Model(n_embd, n_head, dropout, vocab_size, block_size, n_layer, 
-                                device, use_relational_position=use_relational_position_embedding, 
-                                use_relational_time_pitch=use_relational_time_and_pitch_embeddings,use_positional_encoding = use_positional_encoding)
+model = LSTMModel(vocab_size, n_embd, hidden_size, num_layers=n_layer)
 model = model.to(device)
 
 if train_from_pretrained:
-    model.load_state_dict(torch.load('saved_models/model4_music_transformer_yes_relative_positional_embedding_ver2.pth'))
+    model.load_state_dict(torch.load('saved_models/'))
 
 # print the number of parameters in the model
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
@@ -75,13 +70,13 @@ for iter in range(max_iters):
     optimizer.step()
 
     total_time = time.time() - start_time
-    print(f"step {iter}: loss {loss:.4f}, time {total_time:.2f} sec")
+    #print(f"step {iter}: loss {loss:.4f}, time {total_time:.2f} sec")
 
 #save the model
-torch.save(model.state_dict(), 'saved_models/model4_music_transformer_yes_relative_positional_embedding_ver2.pth')
+torch.save(model.state_dict(), 'saved_models/LSTM_model_piano.pth')
 
 # generate from the model
-context = torch.zeros((batch_size, 1), dtype=torch.long, device=device)
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
 encodings = model.generate(context, max_new_tokens=2000)[0].tolist()
 get_decodings(encodings, output_midi_file_path)
 

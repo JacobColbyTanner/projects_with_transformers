@@ -86,7 +86,7 @@ class VanillaRNN(nn.Module):
         # Initialize hidden state with zeros
         return torch.zeros(self.num_layers, batch_size, self.hidden_size)
 
-    def generate(self, x, max_new_tokens=2000, temperature=2):
+    def generate(self, x, max_new_tokens=2000, temperature=2.0):
         h = self.init_hidden(x.size(0)).to(x.device)
         outputs = []
 
